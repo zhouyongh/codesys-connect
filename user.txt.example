@@ -1,0 +1,11 @@
+# codesys-connect credentials template
+# Copy to user.txt (keep it local / gitignored), then:
+#   cc.ps1 connect -Project <project> -UserFile user.txt
+#
+# Format A - two lines:
+your-username
+your-password
+#
+# Format B - key=value (either style works):
+# user=your-username
+# password=your-password

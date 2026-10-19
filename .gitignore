@@ -1,0 +1,11 @@
+# local-only
+user.txt
+*.local.txt
+session.txt
+
+# runtime work
+*.log
+*.bak
+
+# dev probes / scratch (not part of the product)
+dev/
