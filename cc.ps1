@@ -1,11 +1,16 @@
-﻿# cc.ps1 - codesys-connect CLI (compact one-line result per call)
+# cc.ps1 - codesys-connect CLI (compact one-line result per call)
 # Usage:
-#   cc.ps1 connect -Project <path> [-User <name> -Password <pw>] [-UserFile <path>] [-Device name] [-App name]
+#   cc.ps1 connect -Project <path> [-User <name> -Password <pw>] [-UserFile <path>]
+#                  [-Device name] [-App name] [-Address ip] [-Port n]
+#                  [-DeviceName name] [-Gateway name] [-ProjectInfo <sidecar>]
+#                  [-Change Force|Try|Keep|Never]
 #   cc.ps1 read  <var> [<var>...]
 #   cc.ps1 write <name>=<value> [<name>=<value>...]
 #   cc.ps1 start | stop | download | status | disconnect
 # Session: %USERPROFILE%\.codesys-connect\session.txt
 # Credentials: -User/-Password or -UserFile (line1=user, line2=password, or user=/password=).
+# Target: -Address/-Port default to 127.0.0.1:11740 (local SoftMotion). Set both for a real PLC.
+# -Change is never auto-escalated to Force (Force = full download / wipes variables).
 param(
     [Parameter(Position = 0)]
     [string]$Command = "status",
@@ -18,6 +23,11 @@ param(
     [string]$Device = "",
     [string]$App = "",
     [string]$Change = "",
+    [string]$Address = "",
+    [string]$Port = "",
+    [string]$DeviceName = "",
+    [string]$Gateway = "",
+    [string]$ProjectInfo = "",
     [string]$CodesysExe = "",
     [string]$Profile = ""
 )
@@ -38,14 +48,21 @@ if ($UserFile) {
 }
 
 $session = Read-ConnectSession
-if ($Project)  { $session["project"]  = $Project }
-if ($User)     { $session["user"]     = $User }
-if ($Password) { $session["password"] = $Password }
-if ($Device)   { $session["device"]   = $Device }
-if ($App)      { $session["app"]      = $App }
-if ($Change)   { $session["change"]   = $Change }
-if (($Command -eq "connect") -and ($Project -or $User -or $Password)) { Write-ConnectSession $session }
-elseif ($User -or $Password -or $Device -or $App -or $Change) { Write-ConnectSession $session }
+if ($Project)     { $session["project"]     = $Project }
+if ($User)        { $session["user"]        = $User }
+if ($Password)    { $session["password"]    = $Password }
+if ($Device)      { $session["device"]      = $Device }
+if ($App)         { $session["app"]         = $App }
+if ($Change)      { $session["change"]      = $Change }
+if ($Address)     { $session["address"]     = $Address }
+if ($Port)        { $session["port"]        = $Port }
+if ($DeviceName)  { $session["device_name"] = $DeviceName }
+if ($Gateway)     { $session["gateway"]     = $Gateway }
+if ($ProjectInfo) { $session["project_info"] = $ProjectInfo }
+$sessionKeysTouched = @($Project, $User, $Password, $Device, $App, $Change, $Address, $Port, $DeviceName, $Gateway, $ProjectInfo) |
+    Where-Object { $_ -ne "" -and $null -ne $_ }
+if ($sessionKeysTouched.Count -gt 0) { Write-ConnectSession $session }
+
 $argsH = @{}
 if ($session["change"]) { $argsH["change"] = $session["change"] }
 
@@ -67,7 +84,8 @@ switch ($Command.ToLower()) {
         if (-not $session["project"]) { Write-Host "ERR -Project required"; exit 1 }
         if ($Rest.Count -gt 0) { Write-Host "ERR connect takes no positional args"; exit 1 }
         $argsH["change"] = if ($session["change"]) { $session["change"] } else { "Try" }
-        $out = Invoke-CodesysOp -Op connect -OpArgs $argsH -CodesysExe $CodesysExe -Profile $Profile -ProjectFile $session["project"]
+        $out = Invoke-CodesysOp -Op connect -OpArgs $argsH -CodesysExe $CodesysExe -Profile $Profile `
+            -ProjectFile $session["project"] -ProjectInfo $session["project_info"]
     }
     "disconnect" { $out = Invoke-CodesysOp -Op disconnect -OpArgs $argsH -CodesysExe $CodesysExe -Profile $Profile }
     "logout"     { $out = Invoke-CodesysOp -Op logout -OpArgs $argsH -CodesysExe $CodesysExe -Profile $Profile }

@@ -14,7 +14,9 @@ Pairs with **codesys-sync**: create/import the project there, then `download` / 
 ```powershell
 # first time: bind project + credentials (either -User/-Password or -UserFile)
 powershell -NoProfile -ExecutionPolicy Bypass -File <codesys-connect>\cc.ps1 connect `
-    -Project <abs path to .project> -User <name> -Password <pw> [-Device Device] [-App Application]
+    -Project <abs path to .project> -User <name> -Password <pw> `
+    [-Device Device] [-App Application] [-Address 127.0.0.1] [-Port 11740] `
+    [-ProjectInfo <sidecar>] [-Change Try|Never|Force]
 
 # or read credentials from a local file (do not commit it):
 #   user.txt line1 = username, line2 = password
@@ -71,8 +73,31 @@ The target login must exist in the **soft PLC user DB** (SoftMotion/Control Win)
 | `-UserFile` | Credentials file (username, password) |
 | `-Device` | Device node name (default: first PLC-like device) |
 | `-App` | Application node name (default: first Application) |
+| `-Address` / `-Port` | Target IP / port (default `127.0.0.1:11740`). Set both to reach a real PLC |
+| `-DeviceName` / `-Gateway` | Comms settings for the device (gateway name, device name on the bus) |
+| `-ProjectInfo` | Path to the export sidecar (`_project_info.txt` or `*_lastexport.txt`) used for version auto-detect. Needed when the repo is not `projects/<name>.project` + `src/plc/<name>/` |
 | `-Change` | `Try` (default for connect) / `Force` (download) / `Keep` / `Never` |
 | `-CodesysExe` / `-Profile` | Pin a CODESYS install; default matches the project's last-saved version (same rule as codesys-sync) |
+
+### Online change (read this)
+
+`-Change` is honored **as given**. Login **never** auto-escalates to `Force`:
+
+- `Force` = full download — stops the running application and **clears all variables**.
+- `Try` / `Keep` / `Never` failures report `ERR` and stop; they do **not** fall back to `Force`.
+- Only `download` loads a program (its default is `Force`). Use it only when a program load is intended.
+- `status` / `read` / `write` / `connect` will not download. If login is refused, fix the mismatch or run `download` on purpose.
+
+### Project layout / version auto-detect
+
+Works with any repo layout. Version auto-detect looks for a sidecar next to (or above) the `.project`:
+
+1. `-ProjectInfo` or env `CODESYS_CONNECT_PROJECT_INFO` (explicit path)
+2. `_project_info.txt` / `<name>/_project_info.txt` beside the project
+3. `src/plc|src/control|src|plc|export(s)/<name>/_project_info.txt` walking up a few levels
+4. `.codesys-sync|codesys-io|codesys-connect/<name>_lastexport.txt`
+
+Version is read from `compiler_version:` / `compiler=` (and `:`/`=` variants), else the first `[devices]` root-device `version=3.5.x.y`. If still unknown, the newest install is used with a WARN — pass `-ProjectInfo` or `-CodesysExe` to pin.
 
 ## Closed-loop recipe (SoftMotion 3-axis)
 
@@ -93,7 +118,8 @@ Verified: SoftMotion Win V3 **x64** + 3 virtual axes; `set_gateway_and_ip_addres
 - Close the project in the IDE before `download`/`connect` that may save/upgrade; export/import of *source* is codesys-sync's job - this tool only talks **online**.
 - Each command launches CODESYS headless (seconds, not ms). Batch variables into one `read` / `write` call rather than many.
 - Output must stay compact - do not ask this tool for a full symbol dump; use codesys-sync export for that.
-- `OnlineChangeOption.Force` replaces the running app; `Try` attempts online change. Use `Force` when logic changed.
+- `OnlineChangeOption.Force` replaces the running app and **clears variables**. Login never falls back to it; pass `change=Force` (or run `download`) only when a load is intended.
+- All text files (session / target / result / log / run bat) are **UTF-8**. Chinese paths and Chinese error strings are safe.
 - Credentials live in a local session file - do not commit it.
 
 ## Version pinning (read this)

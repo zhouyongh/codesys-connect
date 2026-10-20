@@ -10,12 +10,18 @@
 #   user= password=           (device login credentials)
 #   device=                   (device name under project, default: first PLC device)
 #   app=                      (application name, default: first Application)
+#   address= port=            (target IP / port; default 127.0.0.1:11740)
+#   gateway= device_name=     (optional gateway / device name for comms settings)
 #   vars=a,b,c                (read)
 #   pairs=name=value;name2=v2 (write, ';' separated)
 #   change=Force|Try|Keep|Never   (login/download online-change option)
 #
+# change is honored as given. Login NEVER auto-escalates to Force:
+# Force is a full download (stops the app, clears variables).
+#
 # result file: one status line + optional `name=value` lines. Nothing else.
 
+import codecs
 import os
 import traceback
 
@@ -25,7 +31,7 @@ TARGET = os.environ.get("CODESYS_CONNECT_TARGET") or os.path.join(
 
 def load_cfg(path):
     cfg = {}
-    f = open(path, "r")
+    f = codecs.open(path, "r", "utf-8")
     try:
         for line in f:
             line = line.strip()
@@ -44,13 +50,20 @@ LOG = CFG.get(u"log", u"")
 OUT = []
 
 
+def _write_text(path, text, mode=u"w"):
+    """UTF-8 text I/O. Never let encoding errors hide the real error."""
+    f = codecs.open(path, mode, u"utf-8")
+    try:
+        f.write(text)
+    finally:
+        f.close()
+
+
 def log(msg):
     s = unicode(msg)
     if LOG:
         try:
-            f = open(LOG, "a")
-            f.write(s + u"\n")
-            f.close()
+            _write_text(LOG, s + u"\n", u"a")
         except Exception:
             pass
     # only keep ERR/fatal in the compact result via out(); debug stays in log
@@ -65,11 +78,19 @@ def out(line):
 def flush():
     if not RESULT:
         return
-    f = open(RESULT, "w")
+    body = u"\n".join(OUT) + u"\n"
     try:
-        f.write(u"\n".join(OUT) + u"\n")
-    finally:
-        f.close()
+        _write_text(RESULT, body)
+    except Exception:
+        # last resort: ASCII-safe dump so the caller still sees something
+        try:
+            f = open(RESULT, "w")
+            try:
+                f.write(body.encode("ascii", "replace"))
+            finally:
+                f.close()
+        except Exception:
+            pass
 
 
 def fatal(msg):
@@ -334,26 +355,41 @@ def get_online_app(create=True):
     return (proj, dev, app, online_dev, online_app)
 
 
+def resolve_change(default_name=u"Try"):
+    """Resolve OnlineChangeOption from cfg `change=` (no silent rewrite)."""
+    name = CFG.get(u"change", default_name) or default_name
+    try:
+        return getattr(OnlineChangeOption, name), name
+    except Exception:
+        try:
+            return getattr(OnlineChangeOption, default_name), default_name
+        except Exception:
+            return OnlineChangeOption.Try, u"Try"
+
+
+def do_login(oapp, delete_foreign=False, default_name=u"Try"):
+    """Login with the configured change option ONLY.
+
+    Never escalate to Force on failure: Force means full download (stops the
+    app and clears variables). Callers that want a download must set
+    change=Force explicitly (or use the download op).
+    """
+    change, name = resolve_change(default_name)
+    try:
+        oapp.login(change, delete_foreign)
+        return True
+    except Exception as e:
+        log(u"WARN login(%s, delete_foreign=%s): %r" % (name, delete_foreign, e,))
+        return False
+
+
 def ensure_connected(odeve, oapp, dev=None):
-    """Connect + login (same as op_connect)."""
+    """Connect + login with the configured change option (no Force fallback)."""
     try:
         odeve.connect()
     except Exception as e:
         log(u"WARN connect: %r" % (e,))
-    change_name = CFG.get(u"change", u"Try")
-    try:
-        change = getattr(OnlineChangeOption, change_name)
-    except Exception:
-        change = OnlineChangeOption.Try
-    try:
-        oapp.login(change, False)
-    except Exception:
-        try:
-            oapp.login(OnlineChangeOption.Force, False)
-        except Exception as e:
-            log(u"WARN login: %r" % (e,))
-            return False
-    return True
+    return do_login(oapp, False)
 
 
 def op_status():
@@ -361,8 +397,15 @@ def op_status():
     if oapp is None:
         out(u"ERR no online application")
         return
-    # auto-connect so status is useful on a fresh session
-    ensure_connected(odeve, oapp, dev)
+    # connect without downloading: report state even if login is refused
+    try:
+        try:
+            odeve.connect()
+        except Exception as e:
+            log(u"WARN connect: %r" % (e,))
+    except Exception as e:
+        fatal(u"status: %r" % (e,))
+        return
     try:
         connected = False
         user = u""
@@ -376,6 +419,10 @@ def op_status():
         except Exception:
             pass
         logged = bool(oapp.is_logged_in) if oapp else False
+        if oapp and not logged:
+            # only attempt login with the requested change option; never Force
+            do_login(oapp, False)
+            logged = bool(oapp.is_logged_in) if oapp else False
         astate = unicode(oapp.application_state) if oapp else u"?"
         ostate = unicode(oapp.operation_state) if oapp else u"?"
         out(u"connected=%s user=%s logged_in=%s app_state=%s op_state=%s" % (
@@ -394,21 +441,11 @@ def op_connect():
     except Exception as e:
         fatal(u"connect device: %r" % (e,))
         return
-    # also login the application (downloads if needed) so read/write work
-    change_name = CFG.get(u"change", u"Try")
-    try:
-        change = getattr(OnlineChangeOption, change_name)
-    except Exception:
-        change = OnlineChangeOption.Try
-    try:
-        oapp.login(change, False)
-    except Exception as e:
-        # try Force once
-        try:
-            oapp.login(OnlineChangeOption.Force, False)
-        except Exception as e2:
-            fatal(u"login: %r / force: %r" % (e, e2))
-            return
+    # login the application so read/write work; never escalate to Force
+    if not do_login(oapp, False):
+        fatal(u"login failed (change=%s); not forcing download. "
+              u"Use download if a program load is intended." % CFG.get(u"change", u"Try"))
+        return
     try:
         user = unicode(odeve.current_logged_on_username)
     except Exception:
@@ -422,17 +459,14 @@ def op_login():
     proj, dev, app, odeve, oapp = get_online_app(create=True)
     if oapp is None:
         return
-    change_name = CFG.get(u"change", u"Try")
-    try:
-        change = getattr(OnlineChangeOption, change_name)
-    except Exception:
-        change = OnlineChangeOption.Try
     try:
         try:
             odeve.connect()
         except Exception:
             pass
-        oapp.login(change, False)
+        if not do_login(oapp, False):
+            fatal(u"login failed (change=%s)" % CFG.get(u"change", u"Try"))
+            return
         out(u"OK logged_in=1")
     except Exception as e:
         fatal(u"login: %r" % (e,))
@@ -466,19 +500,11 @@ def op_download():
     except Exception as e:
         fatal(u"connect: %r" % (e,))
         return
-    change_name = CFG.get(u"change", u"Force")
-    try:
-        change = getattr(OnlineChangeOption, change_name)
-    except Exception:
-        change = OnlineChangeOption.Force
-    try:
-        oapp.login(change, True)
-    except Exception as e:
-        try:
-            oapp.login(OnlineChangeOption.Force, True)
-        except Exception as e2:
-            fatal(u"download/login: %r / %r" % (e, e2))
-            return
+    # download is the one place a full load is intended; still honor an
+    # explicit change= (Never means "do not download"), never invent Force.
+    if not do_login(oapp, True, default_name=u"Force"):
+        fatal(u"download/login failed (change=%s)" % CFG.get(u"change", u"Force"))
+        return
     try:
         st = unicode(oapp.application_state)
         op = unicode(oapp.operation_state)
@@ -497,10 +523,9 @@ def op_start():
         except Exception:
             pass
         if not oapp.is_logged_in:
-            try:
-                oapp.login(OnlineChangeOption.Try, False)
-            except Exception:
-                oapp.login(OnlineChangeOption.Force, False)
+            if not do_login(oapp, False):
+                fatal(u"start: login failed (change=%s)" % CFG.get(u"change", u"Try"))
+                return
         oapp.start()
         out(u"OK started=1 op_state=%s" % unicode(oapp.operation_state))
     except Exception as e:
@@ -517,10 +542,9 @@ def op_stop():
         except Exception:
             pass
         if not oapp.is_logged_in:
-            try:
-                oapp.login(OnlineChangeOption.Try, False)
-            except Exception:
-                oapp.login(OnlineChangeOption.Force, False)
+            if not do_login(oapp, False):
+                fatal(u"stop: login failed (change=%s)" % CFG.get(u"change", u"Try"))
+                return
         oapp.stop()
         out(u"OK stopped=1 op_state=%s" % unicode(oapp.operation_state))
     except Exception as e:
@@ -542,10 +566,10 @@ def op_read():
         except Exception:
             pass
         if not oapp.is_logged_in:
-            try:
-                oapp.login(OnlineChangeOption.Try, False)
-            except Exception:
-                oapp.login(OnlineChangeOption.Force, False)
+            if not do_login(oapp, False):
+                fatal(u"read: login failed (change=%s); not forcing download" %
+                      CFG.get(u"change", u"Try"))
+                return
         try:
             vals = oapp.read_values(exprs)
             for i, name in enumerate(exprs):
@@ -587,10 +611,10 @@ def op_write():
         except Exception:
             pass
         if not oapp.is_logged_in:
-            try:
-                oapp.login(OnlineChangeOption.Try, False)
-            except Exception:
-                oapp.login(OnlineChangeOption.Force, False)
+            if not do_login(oapp, False):
+                fatal(u"write: login failed (change=%s); not forcing download" %
+                      CFG.get(u"change", u"Try"))
+                return
         for name, val in pairs:
             try:
                 oapp.set_prepared_value(name, val)
@@ -600,13 +624,6 @@ def op_write():
         try:
             oapp.write_prepared_values()
         except Exception as e:
-            # fallback: direct write via write if prepared path fails
-            for name, val in pairs:
-                try:
-                    # some builds expose write via set_prepared + write_prepared only
-                    pass
-                except Exception:
-                    pass
             fatal(u"write_prepared_values: %r" % (e,))
             return
         for name, val in pairs:

@@ -1,4 +1,4 @@
-﻿# common.ps1 - shared helpers for codesys-connect (dot-source)
+# common.ps1 - shared helpers for codesys-connect (dot-source)
 # Install resolution mirrors codesys-sync: explicit param / env / match project version.
 
 function Get-CodesysInstalls {
@@ -47,11 +47,99 @@ function Get-ProfileForExe {
     $pf.Name -replace '\.profile\.xml$', ''
 }
 
+function Get-ProjectInfoPath {
+    # Locate the export sidecar that carries the project's last-saved version.
+    # Any repo layout is fine: pass -ProjectInfo / CODESYS_CONNECT_PROJECT_INFO,
+    # or let us search a few common spots next to the .project.
+    param(
+        [string]$ProjectFile,
+        [string]$ProjectInfo = ""
+    )
+    if (-not $ProjectInfo) { $ProjectInfo = $env:CODESYS_CONNECT_PROJECT_INFO }
+    if ($ProjectInfo) {
+        if (Test-Path $ProjectInfo) { return (Resolve-Path $ProjectInfo).Path }
+        return $null
+    }
+    if (-not $ProjectFile -or -not (Test-Path $ProjectFile)) { return $null }
+
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($ProjectFile)
+    $safe = ($base -replace '[\\/:*?"<>|\s\(\)（）]+', '-').Trim('-')
+    $dir = Split-Path -Parent $ProjectFile
+
+    $candidates = @()
+    # same folder as the .project
+    $candidates += (Join-Path $dir "_project_info.txt")
+    $candidates += (Join-Path $dir (Join-Path $base "_project_info.txt"))
+    $candidates += (Join-Path $dir (Join-Path $safe "_project_info.txt"))
+
+    # walk up a few levels; cover flat projects/<name>.project and nested
+    # projects/<variant>/<name>.project with any src root name
+    $cur = $dir
+    for ($i = 0; $i -lt 5 -and $cur; $i++) {
+        foreach ($src in @("src\plc", "src\control", "src", "plc", "export", "exports")) {
+            $candidates += (Join-Path $cur (Join-Path $src (Join-Path $base "_project_info.txt")))
+            $candidates += (Join-Path $cur (Join-Path $src (Join-Path $safe "_project_info.txt")))
+        }
+        # nested variant folders under src/*/<variant>/<name>/
+        foreach ($src in @("src\plc", "src\control", "src")) {
+            $srcDir = Join-Path $cur $src
+            if (Test-Path $srcDir) {
+                Get-ChildItem $srcDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                    $candidates += (Join-Path $_.FullName (Join-Path $base "_project_info.txt"))
+                    $candidates += (Join-Path $_.FullName (Join-Path $safe "_project_info.txt"))
+                }
+            }
+        }
+        # lastexport stamp (codesys-sync / codesys-io work dirs)
+        foreach ($work in @(".codesys-sync", ".codesys-io", ".codesys-connect")) {
+            $candidates += (Join-Path (Join-Path $cur $work) ($safe + "_lastexport.txt"))
+            $candidates += (Join-Path (Join-Path $cur $work) ($base + "_lastexport.txt"))
+        }
+        $parent = Split-Path -Parent $cur
+        if ($parent -eq $cur) { break }
+        $cur = $parent
+    }
+
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) { return $c }
+    }
+    return $null
+}
+
+function Get-ProjectSavedVersion {
+    # Read the last-saved compiler version from a sidecar text file.
+    # Accepts the common shapes used by codesys-sync / codesys-io exports:
+    #   compiler_version: 3.5.17.20
+    #   compiler_version=3.5.17.20
+    #   compiler=3.5.17.20
+    #   compiler: 3.5.17.20
+    # Fallback: first root-device line in [devices]  "Device  type=4102 ... version=3.5.x.y"
+    param([string]$InfoPath)
+    if (-not $InfoPath -or -not (Test-Path $InfoPath)) { return $null }
+    $text = Get-Content -Path $InfoPath -Encoding UTF8 -ErrorAction SilentlyContinue
+    if (-not $text) { $text = Get-Content -Path $InfoPath -ErrorAction SilentlyContinue }
+    foreach ($line in $text) {
+        if ($line -match '^\s*compiler(?:_version)?\s*[:=]\s*([0-9]+(?:\.[0-9]+)+)') {
+            return $matches[1]
+        }
+    }
+    $inDevices = $false
+    foreach ($line in $text) {
+        if ($line -match '^\s*\[devices\]') { $inDevices = $true; continue }
+        if ($inDevices -and $line -match '^\s*\[') { break }
+        if ($inDevices -and $line -match '^\s*Device\b.*?\bversion=([0-9]+(?:\.[0-9]+)+)') {
+            return $matches[1]
+        }
+    }
+    return $null
+}
+
 function Resolve-CodesysInstall {
     param(
         [string]$Exe = "",
         [string]$ProfileName = "",
-        [string]$ProjectFile = ""
+        [string]$ProjectFile = "",
+        [string]$ProjectInfo = ""
     )
     if (-not $Exe) { $Exe = $env:CODESYS_CONNECT_EXE }
     if (-not $Exe) { $Exe = $env:CODESYS_SYNC_EXE }
@@ -63,22 +151,9 @@ function Resolve-CodesysInstall {
         if ($installs.Count -eq 0) { throw "No CODESYS 3.5 installation found." }
         $want = $null
         if ($ProjectFile -and (Test-Path $ProjectFile)) {
-            # sidecar from codesys-sync export or lastexport stamp
-            $projDir = Split-Path -Parent $ProjectFile          # ...\projects
-            $repo    = Split-Path -Parent $projDir              # repo root
-            $base = [System.IO.Path]::GetFileNameWithoutExtension($ProjectFile)
-            $safe = ($base -replace '[\\/:*?"<>|\s\(\)（）]+', '-').Trim('-')
-            $candidates = @(
-                (Join-Path $repo ("src\plc\" + $safe + "\_project_info.txt")),
-                (Join-Path $repo ("src\plc\" + $base + "\_project_info.txt")),
-                (Join-Path $repo (".codesys-sync\" + $safe + "_lastexport.txt")),
-                (Join-Path $repo (".codesys-sync\" + $base + "_lastexport.txt"))
-            )
-            foreach ($c in $candidates) {
-                if (Test-Path $c) {
-                    $line = Select-String -Path $c -Pattern '^\s*compiler(?:_version)?\s*[:=]\s*([0-9.]+)' | Select-Object -First 1
-                    if ($line) { $want = $line.Matches[0].Groups[1].Value; break }
-                }
+            $infoPath = Get-ProjectInfoPath -ProjectFile $ProjectFile -ProjectInfo $ProjectInfo
+            if ($infoPath) {
+                $want = Get-ProjectSavedVersion -InfoPath $infoPath
             }
         }
         if ($want) {
@@ -96,7 +171,7 @@ function Resolve-CodesysInstall {
         } else {
             $newest = $installs | Select-Object -Last 1
             $Exe = $newest.Exe
-            Write-Host "WARN: project version unknown; using $($newest.InstallName)"
+            Write-Host "WARN: project version unknown; using $($newest.InstallName). Pass -ProjectInfo <_project_info.txt or *_lastexport.txt> or -CodesysExe to pin."
         }
     }
     if (-not (Test-Path $Exe)) { throw "CODESYS.exe not found: $Exe" }
@@ -139,11 +214,14 @@ function Invoke-CodesysOp {
         [hashtable]$OpArgs = @{},
         [string]$CodesysExe = "",
         [string]$Profile = "",
-        [string]$ProjectFile = ""
+        [string]$ProjectFile = "",
+        [string]$ProjectInfo = ""
     )
     $session = Read-ConnectSession
     if (-not $ProjectFile) { $ProjectFile = $session["project"] }
-    $install = Resolve-CodesysInstall -Exe $CodesysExe -ProfileName $Profile -ProjectFile $ProjectFile
+    if (-not $ProjectInfo) { $ProjectInfo = $session["project_info"] }
+    $install = Resolve-CodesysInstall -Exe $CodesysExe -ProfileName $Profile `
+        -ProjectFile $ProjectFile -ProjectInfo $ProjectInfo
 
     $work = Join-Path $env:USERPROFILE ".codesys-connect\work"
     New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -159,21 +237,24 @@ function Invoke-CodesysOp {
         "log=$log"
     )
     foreach ($k in $OpArgs.Keys) { $lines += "$k=$($OpArgs[$k])" }
-    # merge session fields not overridden
-    foreach ($k in @("user","password","device","app","gateway")) {
+    # merge session fields not overridden (incl. target address for real PLCs)
+    foreach ($k in @("user","password","device","app","gateway","address","port","device_name")) {
         if (-not $OpArgs.ContainsKey($k) -and $session[$k]) { $lines += "$k=$($session[$k])" }
     }
     $utf8 = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllLines($target, $lines, $utf8)
     $env:CODESYS_CONNECT_TARGET = $target
 
+    # UTF-8 BOM bat so non-ASCII paths survive; cmd reads BOM batches as UTF-8.
+    # Call via cmd (not &) so --profile quoting is not mangled by PS 5.1.
     $bat = Join-Path $work "run_op.bat"
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
     [System.IO.File]::WriteAllLines($bat, @(
         "@echo off",
         "set CODESYS_CONNECT_TARGET=$target",
         "`"$($install.Exe)`" --noUI --profile=`"$($install.Profile)`" --runscript=`"$(Join-Path $PSScriptRoot 'online_ops.py')`"",
         "exit /b %ERRORLEVEL%"
-    ), [System.Text.Encoding]::ASCII)
+    ), $utf8Bom)
     # swallow CODESYS progress spam on stderr; result file is the truth
     $old = $ErrorActionPreference
     $ErrorActionPreference = "Continue"

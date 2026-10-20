@@ -29,6 +29,10 @@ Built on the CODESYS Scripting Engine (`online` API). Windows + PowerShell 5.1. 
 2. Clone this repo (or drop the folder into your agent's skills directory).
 3. Copy `user.txt.example` to `user.txt`, fill in username/password, keep it local.
 4. `cc.ps1 connect -Project <your .project> -UserFile user.txt` then `download` / `start` / `read` / `write`.
+   - Real PLC: add `-Address <ip> -Port <port>` (default is local SoftMotion `127.0.0.1:11740`).
+   - Non-`projects/<name>.project` layout: pass `-ProjectInfo <path to _project_info.txt or *_lastexport.txt>` if version auto-detect warns.
+
+Any repo layout works. Login never auto-downloads: `-Change Never|Try|Keep` is honored as given; only `download` loads a program (`Force`).
 
 Works out of the box with [codesys-sync](https://github.com/zhouyongh/codesys-sync) projects (`projects/` + `src/plc/` layout).
 
